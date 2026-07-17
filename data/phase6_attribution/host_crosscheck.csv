@@ -1,0 +1,7 @@
+pair,host_file,host_idle_w,host_active_s,host_delta_e_j,pct_diff_vs_union,container_union_delta_e_j
+vgg16+rnn,host_vgg16_rnn.csv,48.0,62,20019.0,-5.049644241526646,21083.64928186539
+resnet50+xgboost,host_resnet50_xgboost.csv,50.0,63,15473.0,-3.379626163561738,16014.220795909088
+lstm+gru,host_lstm_gru.csv,51.0,58,4623.0,-3.9677450004227484,4814.0075436324505
+vgg16+resnet18,host_vgg16_resnet18.csv,49.0,61,20549.0,-4.188203652564726,21447.254704926596
+xgboost+rnn,host_xgboost_rnn.csv,50.0,62,4294.0,-5.282512876166992,4533.481757583004
+resnet50+lstm,host_resnet50_lstm.csv,49.0,60,15832.0,-3.835849913816115,16463.515754895252

@@ -1,0 +1,493 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{subcaption}
+
+% Placeholder command for items needing data
+\newcommand{\tbd}[1]{\textcolor{red}{\textbf{[#1]}}}
+
+\begin{document}
+
+\title{Beyond Proportional Allocation: Transistor-Level Energy Attribution for Containerized ML Workloads}
+
+% ANONYMIZED FOR DOUBLE-BLIND REVIEW. RESTORE AT CAMERA-READY:
+% \author{
+% \IEEEauthorblockN{Muntaser Syed\IEEEauthorrefmark{1}, Marius Silaghi\IEEEauthorrefmark{1}, Sheikh Abujar\IEEEauthorrefmark{2}, Sharun Akter Khushbu\IEEEauthorrefmark{3}}
+% \IEEEauthorblockA{\IEEEauthorrefmark{1}Florida Institute of Technology, Melbourne, FL, USA\\
+% msyed2011@my.fit.edu, msilaghi@fit.edu}
+% \IEEEauthorblockA{\IEEEauthorrefmark{2}The University of Alabama at Birmingham, Birmingham, AL, USA\\
+% sabujar@uab.edu}
+% \IEEEauthorblockA{\IEEEauthorrefmark{3}Daffodil International University, Dhaka, Bangladesh\\
+% sharun.cse@diu.edu.bd}
+% }
+\author{
+\IEEEauthorblockN{Anonymous Authors}
+\IEEEauthorblockA{Details omitted for double-blind review}
+}
+
+\maketitle
+
+%==============================================================================
+\begin{abstract}
+Accurate per-container energy attribution is a prerequisite for carbon-aware billing, workload placement, and sustainability compliance in cloud environments. Existing container energy monitoring tools, including cAdvisor, Kepler, and Scaphandre, distribute host energy across containers proportionally to CPU or GPU utilization time. This strategy assumes that all workloads consume energy at the same rate per unit of utilization and that operating conditions remain stable across time. Neither assumption holds for machine learning inference: on an NVIDIA A100 we measure a 7.7$\times$ range in power draw across seven containerized ML architectures, and energy per transistor operation rises with die temperature by 2.3 to 14.6\% between cold and sustained operating points, shifting calibrated coefficients by as much as 38.7\% at the temperature deltas co-location induces. We extend the Transistor Operations for Machine Learning (TOML) framework, which traces per-operation energy costs to CMOS switching dynamics, with three container-aware metrics: Thermal Efficiency Decay (TED), Sustained Power Proportionality (SPP), and Co-location Thermal Interference (CTI). All three enter a single conservative attribution model: SPP validates distributing energy by completed transistor operations, TED corrects calibrated coefficients for die temperature, and CTI quantifies the signed interference residual the model distributes. Across six MPS co-location pairs, proportional allocation misattributes energy by 70.2\% on average and up to 194.9\%, while the TED-adjusted model reduces the mean to 32.9\%, with nearly all of the remainder accounted for by measured contention slowdown rather than model error. Container-side telemetry meanwhile overstates a light tenant's energy by factors of 5.7 to 17.8 under MPS. The attribution layer runs on counters existing drivers already expose.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Container energy attribution, GPU power modeling, green cloud computing, ML inference efficiency, thermal modeling, multi-tenant GPU sharing
+\end{IEEEkeywords}
+
+%==============================================================================
+\section{Introduction}
+\label{sec:intro}
+%==============================================================================
+
+The energy consumption of cloud-hosted machine learning workloads has become a first-order concern for both sustainability and cost management~\cite{patterson2022carbon}. As organizations and, increasingly, national sovereign AI programs~\cite{syed2026sovereign} deploy diverse ML models as containerized microservices on shared GPU infrastructure, accurate per-container energy attribution becomes essential for carbon accounting, cost allocation, and placement optimization.
+
+Current practice relies on proportional allocation: tools such as cAdvisor~\cite{cadvisor2024}, Kepler~\cite{kepler2023}, and Scaphandre~\cite{scaphandre2023} distribute total host or GPU energy across containers in proportion to their utilization share. This approach implicitly assumes that all workloads consume energy at the same rate per unit of utilization. For CPU-bound web services with similar instruction mixes, this approximation may be adequate. For GPU-accelerated ML inference, this assumption does not hold.
+
+ML workloads differ widely in energy profile depending on architecture. A memory-bound model such as VGG-16 (138M parameters, MCER = 2.33) consumes energy primarily through data movement, while a lightweight recurrent network processes sequences with minimal memory traffic. On an NVIDIA A100 GPU, we measure a 7.7$\times$ range in power draw across seven standard ML architectures, from 45.2W (XGBoost) to 347.4W (VGG-16). If two containers running these workloads share a GPU with equal time-slicing, proportional allocation assigns each container 50\% of total energy while the actual split is approximately 88 to 12. The attribution error for the lighter workload exceeds 300\% in this idealized case; under measured MPS co-location the worst case we observe is 194.9\% (Section~\ref{sec:attribution}).
+
+Beyond static workload differences, thermal dynamics introduce a second source of error. Sustained GPU utilization raises die temperature, increasing leakage current and, for some architectures, triggering clock reduction. On the A100, energy per transistor operation rises with die temperature by 2.3 to 14.6\% across the spans our seven architectures reach under sustained load, and the gap between an architecture's calibration temperature and the temperature it experiences beside a hot neighbor reaches 15 to 20\textdegree C, shifting calibrated coefficients by as much as 38.7\%. A container that starts on a cold GPU consumes measurably less energy per unit of work than the same container on a die warmed by a previous tenant. Proportional allocation has no mechanism to account for this.
+
+We address these limitations by extending the Transistor Operations for Machine Learning (TOML) framework~\cite{syed2026toml}, which traces energy consumption to CMOS switching dynamics. TOML models an inference workload as a count of transistor switching events priced by architecture-specific coefficients derived from semiconductor physics, and its six metrics reproduce measured energy across CNN, recurrent, and gradient boosting architectures with $r^2 = 0.961$ on both CPU and GPU hardware~\cite{syed2026toml}. That grounding matters for attribution: coefficients anchored in device behavior can be corrected for operating conditions instead of refitted per deployment. TOML was validated on bare-metal hardware under fixed operating conditions. In this paper we extend it to the cloud, where thermal dynamics, load variation, and multi-tenancy break the assumptions that proportional allocation relies on. Our contributions are:
+
+\begin{enumerate}
+    \item Three container-aware metrics, Thermal Efficiency Decay (TED), Sustained Power Proportionality (SPP), and Co-location Thermal Interference (CTI), integrated into a single conservative attribution model in which each metric has a defined role: TED corrects calibrated coefficients for die temperature, SPP validates distributing residual energy by completed transistor operations, and CTI quantifies interference and telemetry contamination.
+
+    \item A four-rung ablation on an NVIDIA A100 across six MPS co-location pairs showing that proportional allocation misattributes energy by 70.2\% on average (194.9\% maximum) while the TED-adjusted model reduces this to 32.9\% (77.7\% maximum), together with a decomposition attributing nearly all residual deviation to measured contention slowdown rather than model error.
+
+    \item Quantification of telemetry contamination under MPS: the energy a light tenant observes for itself through device-level counters exceeds its attributed energy by factors of 5.7 to 17.8, and the interference residual is signed, including a consolidation case in which co-locating two similar workloads saves 30.6\% energy.
+
+    \item A lightweight attribution architecture integrating these metrics into existing cloud observability stacks (Prometheus, Grafana) with no hardware modifications, supported by cross-generation coefficient transfer (RTX 4090 to A100 within 1.5$\times$ for five of six neural architectures) that avoids per-GPU recalibration.
+\end{enumerate}
+
+
+%==============================================================================
+\section{Background and Related Work}
+\label{sec:related}
+%==============================================================================
+
+\subsection{Container Energy Monitoring}
+
+Container energy monitoring in production cloud environments relies on indirect estimation. cAdvisor~\cite{cadvisor2024} collects per-container CPU and memory usage from kernel cgroups and distributes host energy proportionally. Kepler~\cite{kepler2023} is more sophisticated on the CPU side: it trains regression power models on hardware performance counters and RAPL telemetry, with eBPF-based attribution to processes, containers, and pods, so CPU energy shares reflect instruction mix rather than utilization time alone. For GPUs, however, Kepler divides device power across containers by utilization ratio, because per-process GPU power is not observable through existing interfaces. SmartWatts~\cite{fieni2020smartwatts} follows a similar counter-driven design for CPU and DRAM with online self-calibration, again without a GPU model, and Scaphandre~\cite{scaphandre2023} reads RAPL counters for per-process CPU power with no GPU attribution mechanism.
+
+Whatever their CPU sophistication, these tools treat GPU energy as a resource divisible by time or utilization share. Jay et al.~\cite{jay2023experimental} compared software-based power meters and found significant discrepancies between estimated and measured GPU power, particularly for workloads with irregular memory access patterns. Yang et al.~\cite{yang2024nvidiasmi} audited the on-board NVIDIA power sensor across 70 GPUs and found generation-dependent behavior in which the A100 samples power over only about a quarter of runtime, which motivates the dual-telemetry cross-check in our measurement protocol (Section~\ref{sec:setup}).
+
+Khan et al.~\cite{khan2018rapl} demonstrated that RAPL-based CPU power attribution is reasonably accurate for homogeneous workloads but degrades for mixed workloads with different memory intensities. We show that the analogous problem for GPU containers is substantially worse because the power range across ML architectures (7.7$\times$) far exceeds typical CPU workload variation. Architectural power models such as GPUWattch~\cite{leng2013gpuwattch} and AccelWattch~\cite{kandiah2021accelwattch} estimate GPU power from microarchitectural activity in cycle-level simulation; TOML targets the complementary deployment setting, pricing workloads from counters available on production hardware without simulation.
+
+\subsection{GPU Multi-Tenancy}
+\label{sec:multitenancy}
+
+GPU sharing among containers is typically achieved through one of three mechanisms: time-slicing (the default in CUDA), NVIDIA Multi-Process Service (MPS)~\cite{nvidiamps2024}, or Multi-Instance GPU (MIG). Time-slicing interleaves kernel execution; MPS enables spatial sharing with concurrent execution; MIG provides hardware-partitioned isolation.
+
+The three modes pose distinct attribution problems. Time-slicing serializes execution, so attribution reduces to temporal accounting over well-separated intervals. MIG partitions receive dedicated compute and memory with per-partition utilization tracking, yet the device still reports only whole-GPU power, and apportioning that power among instances is an open problem of its own~\cite{vamja2025mig}; partitions also share the die's thermal envelope. MPS is the hardest case: tenants execute concurrently on shared SMs, so neither time nor space separates their energy, and thermal coupling is strongest. We therefore evaluate attribution under MPS, where proportional allocation fails most severely and where CTI is defined.
+
+Yu and Chowdhury~\cite{yu2020fine} showed that fine-grained GPU sharing primitives can improve utilization but noted that energy accounting remains unsolved. Amaral et al.~\cite{amaral2017topology} demonstrated topology-aware GPU scheduling but relied on utilization as the energy proxy. Our work provides the missing energy model that enables these scheduling approaches to account for actual per-workload energy consumption.
+
+\subsection{The TOML Framework}
+
+Syed et al.~\cite{syed2026toml} introduced TOML, which grounds ML energy estimation in CMOS switching dynamics. The core model traces energy to transistor operations:
+
+\begin{equation}
+E_{op} = \beta_{op} \cdot \alpha_{op} \cdot N_{TO}
+\label{eq:toml_core}
+\end{equation}
+
+where $\beta_{op}$ is an operation-specific energy coefficient, $\alpha_{op}$ is the switching activity factor, and $N_{TO}$ is the transistor operation count. TOML introduces six metrics: SAF-T (switching activity per token), LSRT (logic state residence time), ECU (energy per capability unit), MCER (memory-compute energy ratio), DDEV (data-dependent energy variation), and CpTO (capability per transistor operation).
+
+TOML was, however, developed and validated under fixed operating conditions: single workload, stable temperature, fixed clock frequency. The original study~\cite{syed2026toml} explicitly noted dynamic voltage and frequency scaling (DVFS) and cross-platform generalization as open limitations. This paper addresses both.
+
+
+%==============================================================================
+\section{Extended TOML Metrics for Containers}
+\label{sec:metrics}
+%==============================================================================
+
+We introduce three metrics that capture energy dynamics unique to multi-tenant cloud environments: thermal effects, load-proportionality, and co-location interference. They extend TOML's six-metric framework to multi-tenant operation.
+
+\subsection{Thermal Efficiency Decay (TED)}
+
+Sustained GPU utilization raises die temperature, which degrades energy efficiency through two mechanisms: increased transistor leakage current (approximately doubling per 10\textdegree C in modern CMOS nodes~\cite{rabaey2003}) and clock frequency reduction via the GPU's boost algorithm. TED quantifies this degradation:
+
+\begin{equation}
+\text{TED}(A_i) = \frac{d(E_{TO})}{dT}
+\label{eq:ted}
+\end{equation}
+
+where $E_{TO}$ is the measured energy per transistor operation and $T$ is die temperature. We compute TED as the slope of a linear regression of $E_{TO}$ versus temperature over a sustained run, with a normalized percentage form evaluated on the fitted line between the observed temperature extremes:
+
+\begin{equation}
+\text{TED}_{\%}(A_i) = \frac{E_{TO}(T_{max}) - E_{TO}(T_{min})}{E_{TO}(T_{min})} \times 100
+\label{eq:ted_pct}
+\end{equation}
+
+TED matters for attribution because a container that follows a thermally intensive tenant pays a ``thermal tax'' invisible to utilization-based accounting: the same work costs more energy on a hotter die.
+
+\subsection{Sustained Power Proportionality (SPP)}
+
+Proportional allocation implicitly assumes that power scales linearly with utilization for all workloads. SPP tests this assumption directly:
+
+\begin{equation}
+\text{SPP}(A_i) = r^2 \text{ of } P_{\Delta}(t) \sim \beta \cdot \dot{N}_{TO}(t)
+\label{eq:spp}
+\end{equation}
+
+where $P_{\Delta} = P_{load} - P_{idle}$ is the delta power above idle and $\dot{N}_{TO}$ is the transistor operation throughput. SPP is measured by varying the workload duty cycle across five load levels (10\%, 25\%, 50\%, 75\%, 100\%) and fitting a linear model.
+
+SPP close to 1.0 indicates that power tracks useful work linearly; when two co-located containers differ in SPP, proportional allocation systematically overcharges the high-SPP workload and undercharges the low-SPP one.
+
+\subsection{Co-location Thermal Interference (CTI)}
+
+CTI captures the energy overhead one container imposes on another through shared-die thermal coupling:
+
+\begin{equation}
+\text{CTI}(A_i, A_j) = \frac{E_{co}(A_i | A_j)}{E_{iso}(A_i)} - 1
+\label{eq:cti}
+\end{equation}
+
+where $E_{co}(A_i | A_j)$ is the energy consumed by $A_i$ when $A_j$ is co-located on the same GPU, and $E_{iso}(A_i)$ is the energy consumed by $A_i$ in isolation. CTI is asymmetric: $\text{CTI}(A_i, A_j) \neq \text{CTI}(A_j, A_i)$ in general, because the thermal and resource interference depends on the characteristics of both workloads. As measured through per-container device-level telemetry, $E_{co}(A_i | A_j)$ is what $A_i$'s own monitor observes; Section~\ref{sec:attribution} quantifies how far that observation departs from attributable energy under MPS.
+
+CTI has no bare-metal equivalent: a positive value means co-location increases energy beyond the sum of isolated runs, an overhead that proportional allocation distributes incorrectly or ignores entirely.
+
+\subsection{Integrated Attribution Model}
+\label{sec:model}
+
+The three metrics enter attribution as follows. TED supplies a thermal correction to the calibrated energy coefficient of each architecture:
+
+\begin{equation}
+E_{TO}^{(i)}(T) = E_{TO}^{(i)}(T_{cal,i}) + s_i \left( T - T_{cal,i} \right)
+\label{eq:ted_adjust}
+\end{equation}
+
+where $E_{TO}^{(i)}(T_{cal,i})$ is the coefficient calibrated from isolated runs at mean die temperature $T_{cal,i}$, and $s_i$ is the thermal sensitivity of architecture $A_i$ in joules per transistor operation per degree, obtained from the regression of Eq.~\ref{eq:ted} over a sustained thermal run. The physics estimate for a co-located container is then $\hat{E}_i = N_{TO}^{(i)} \cdot E_{TO}^{(i)}(T_i)$, where $N_{TO}^{(i)}$ counts the transistor operations the container actually completed and $T_i$ is the mean die temperature over its execution window.
+
+A billing scheme must distribute exactly the energy the GPU consumed, no more and no less. The physics estimates alone do not satisfy this requirement: their sum differs from the measured total by a signed residual $E_{ov} = E_{total} - \sum_j \hat{E}_j$, which is positive when co-location adds interference cost and negative when consolidation saves energy. The attribution rule distributes this residual in proportion to completed work:
+
+\begin{equation}
+E_{TOML}(A_i) = \hat{E}_i + \frac{N_{TO}^{(i)}}{\sum_j N_{TO}^{(j)}} \cdot E_{ov}
+\label{eq:toml_attribution}
+\end{equation}
+
+Each metric carries a specific load in this model. SPP validates the proportional distribution of the residual: power tracks transistor operation throughput linearly for every architecture we test (Section~\ref{sec:spp_results}), so work share is a defensible basis for splitting energy that the coefficients do not explain, and the residual term absorbs any departure from additivity under concurrency. TED enters Eq.~\ref{eq:ted_adjust} directly. CTI quantifies what the model must correct: the magnitude and sign of $E_{ov}$, and the degree to which container-side telemetry misreports light tenants when a heavy neighbor shares the die. Section~\ref{sec:attribution} evaluates each component of this model in ablation.
+
+
+%==============================================================================
+\section{Experimental Setup}
+\label{sec:setup}
+%==============================================================================
+
+\subsection{Hardware Platform}
+
+All experiments were conducted on a Lambda Labs cloud instance with a single NVIDIA A100 40GB SXM4 GPU (Ampere architecture, 6912 CUDA cores, 400W TDP), 30 vCPUs, and 200 GiB system RAM, running Ubuntu 22.04 with CUDA 13.0 and driver version 580.105.08. Power, temperature, and clock frequency were sampled via NVIDIA's NVML library (pynvml) at 50ms intervals from within each container or process.
+
+Cross-platform validation uses data from the original TOML study~\cite{syed2026toml} on an NVIDIA RTX 4090 Laptop GPU (Ada Lovelace, 9728 CUDA cores, 150W TDP).
+
+\subsection{Benchmark Suite}
+
+We evaluate seven ML architectures spanning four paradigms, carried forward from the TOML framework to enable direct comparison with prior results: ResNet-18 (11.7M parameters), ResNet-50 (25.6M), and VGG-16 (138M) as CNNs processing 224$\times$224$\times$3 images in batches of 32; a vanilla RNN (0.4M), an LSTM (1.6M), and a GRU (1.2M), each two layers with hidden size 256, processing sequences of length 100 with input dimension 128; and XGBoost (100 trees, depth 6) performing GPU-accelerated inference on 20,000 test samples with 100 features.
+
+\subsection{Container Configuration}
+
+Each benchmark runs inside a Docker container with GPU passthrough via NVIDIA Container Toolkit. The container image is based on \texttt{nvidia/cuda:12.4.0-runtime-ubuntu22.04} with PyTorch 2.5.1, XGBoost 2.1.3, and pynvml for internal power monitoring.
+
+For co-location experiments (Section~\ref{sec:colocation}), two containers share the GPU via NVIDIA MPS~\cite{nvidiamps2024}, enabling concurrent spatial execution rather than time-slicing. We use MPS because it is the sharing mode in which attribution is hardest (Section~\ref{sec:multitenancy}).
+
+\subsection{Conventional Baseline: Proportional Allocation}
+
+We implement the proportional allocation method used by cAdvisor and similar tools. For two co-located containers $A_i$ and $A_j$:
+
+\begin{equation}
+E_{prop}(A_i) = E_{total} \cdot \frac{t_{active}(A_i)}{t_{active}(A_i) + t_{active}(A_j)}
+\label{eq:proportional}
+\end{equation}
+
+where $E_{total}$ is the total GPU energy during the co-located run and $t_{active}$ is the active execution time per container.
+
+\subsection{Measurement Protocol and Ground Truth}
+
+Each experiment follows a standardized protocol: (1) GPU cool-down to below 35\textdegree C; (2) idle baseline measurement (10 seconds, 50ms sampling); (3) workload execution (60 seconds for standard runs, 15 minutes for thermal profiling). Bare-metal, isolated, and load-sweep configurations, which supply the calibration coefficients, the attribution ground truth, and the SPP fits, are repeated 3 times; the coefficient of variation of delta energy across repetitions is below 1.1\% for six of the seven architectures and 2.8\% for ResNet-50. Thermal trajectories and co-location pairs use single instrumented runs, with co-located totals cross-checked against an independent telemetry source as described below.
+
+All reported energies are delta energies above the per-run measured idle baseline (43.7 to 51.2W across runs). Idle power is treated as a fixed platform cost outside tenant attribution; policies that allocate idle draw, for example by reservation share, compose with any attribution rule and are orthogonal to the comparison in Section~\ref{sec:attribution}.
+
+Ground truth for attribution error is the mean isolated delta energy of each architecture over its 3 calibration runs: the cost of the same 60 second GPU occupancy running alone. A co-located container can deviate from this reference for physically real reasons, in particular because contention reduces the work it completes in the same wall time; Section~\ref{sec:attribution} decomposes the deviation accordingly.
+
+For co-located runs, total GPU energy is integrated from the merged 50ms power samples of both containers over the union of their execution windows. An independent host-side \texttt{nvidia-smi dmon} trace, collected at 1Hz, corroborates the integrated totals on all six pairs, reading 3.4 to 5.3 percent lower, a systematic offset consistent with its 1Hz integer-watt sampling.
+
+%==============================================================================
+\section{Results}
+\label{sec:results}
+%==============================================================================
+
+\subsection{Bare-Metal Baseline and Container Overhead}
+
+Table~\ref{tab:baremetal} presents bare-metal energy measurements for all seven architectures on the A100, alongside isolated container measurements.
+
+\begin{table}[t]
+\centering
+\caption{Bare-Metal vs. Container Energy (A100 40GB, 60s runs, mean of 3)}
+\label{tab:baremetal}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{BM (J)} & \textbf{Cont. (J)} & \textbf{Raw $\Delta$} & \textbf{$\Delta$T (\textdegree C)} & \textbf{Power (W)} \\
+\midrule
+ResNet-18 & 15,962 & 15,863 & $-$0.6\% & +2 & 266 \\
+ResNet-50 & 15,102 & 15,449 & +2.3\% & +2 & 252 \\
+VGG-16 & 20,841 & 20,882 & +0.2\% & +13 & 347 \\
+RNN & 3,277 & 3,575 & +9.1\%$^\dagger$ & +12 & 55 \\
+LSTM & 3,332 & 3,682 & +10.5\%$^\dagger$ & +12 & 56 \\
+GRU & 2,938 & 3,256 & +10.8\%$^\dagger$ & +13 & 49 \\
+XGBoost & 2,712 & 2,853 & +5.2\%$^\dagger$ & +14 & 45 \\
+\bottomrule
+\end{tabular}
+\begin{flushleft}
+\footnotesize{$^\dagger$Apparent overhead caused by thermal state difference, not container virtualization. Bare-metal runs started at 33 to 35\textdegree C; container runs at 47 to 49\textdegree C due to residual heat. See Section~\ref{sec:ted_results}.}
+\end{flushleft}
+\end{table}
+
+Power draw spans 7.7$\times$ from XGBoost (45.2W) to VGG-16 (347.4W), as Fig.~\ref{fig:power_range} shows. Reproducibility is excellent, with coefficient of variation below 1.1\% for all architectures across the three bare-metal runs. For compute-heavy CNNs that quickly reach thermal equilibrium, true container overhead is below 2.5\%, confirming that Docker GPU passthrough introduces negligible energy cost. The apparent 9 to 11\% overhead for lightweight workloads (RNN, LSTM, GRU) is an artifact of thermal state: container runs started 12 to 14\textdegree C hotter than bare-metal runs due to residual heat from prior experiments. These workloads draw too little power to reach thermal equilibrium, so their energy consumption is dominated by starting temperature rather than workload characteristics. This observation itself validates the need for TED: even within a controlled experimental sequence, thermal history introduces measurement differences that proportional allocation cannot distinguish from workload differences.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig1_power_range.pdf}
+\caption{GPU power draw across seven ML architectures on the A100 (means of 3 bare-metal runs), spanning a 7.7$\times$ range from XGBoost (45.2W) to VGG-16 (347.4W).}
+\label{fig:power_range}
+\end{figure}
+
+\subsection{Thermal Efficiency Decay}
+\label{sec:ted_results}
+
+\begin{table}[t]
+\centering
+\caption{Thermal Efficiency Decay (per-window regression of $E_{TO}$ on die temperature over 15-minute sustained runs)}
+\label{tab:ted}
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+\textbf{Model} & \textbf{TED\%} & \textbf{$r^2$} & \textbf{T range (\textdegree C)} & \textbf{Per \textdegree C} & \textbf{Clock drop} \\
+\midrule
+ResNet-18 & 9.3 & 0.97 & 64 to 76 & 0.78\% & 20.2\% \\
+ResNet-50 & 9.8 & 0.94 & 63 to 76 & 0.75\% & 0\% \\
+VGG-16 & 2.3 & 0.55 & 69 to 78 & 0.26\% & 3.2\% \\
+RNN & 6.0 & 0.87 & 52 to 56 & 1.50\% & 22.3\% \\
+LSTM & 14.6 & 0.99 & 44 to 56 & 1.22\% & 22.3\% \\
+GRU & 6.2 & 0.91 & 39 to 45 & 1.03\% & 20.2\% \\
+XGBoost & 8.7 & 0.31 & 50 to 53 & 2.89\% & 0\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig4_ted_regression.pdf}
+\caption{TED regressions for ResNet-50 and LSTM: per-window energy per transistor operation against window mean die temperature over the 15-minute sustained runs, with the fitted slopes and $r^2$ reported in Table~\ref{tab:ted}.}
+\label{fig:ted_regression}
+\end{figure}
+
+TED ranges from 2.3\% (VGG-16) to 14.6\% (LSTM) across the temperature span each architecture reaches under sustained load, with regression fits of $r^2 \geq 0.87$ for six of the seven architectures. Fig.~\ref{fig:ted_regression} shows the fitted regressions for ResNet-50 and LSTM. Three observations stand out. First, ResNet-50 exhibits 9.8\% TED with no clock frequency reduction at all (1410 MHz throughout), isolating increased leakage current as the sole cause of its thermal penalty. Second, ResNet-18 shows a comparable 9.3\% TED together with a 20\% clock drop (1410 to 1125 MHz), so its penalty mixes leakage and DVFS effects. Third, VGG-16 has the lowest TED despite reaching the highest absolute temperature (78\textdegree C). Because VGG-16 is memory-bound (MCER = 2.33), its energy is dominated by data movement, which is less sensitive to die temperature than SM compute operations. The XGBoost fit is weak ($r^2 = 0.31$): its bursty inference pattern yields noisy per-window throughput, and we treat its fitted sensitivity with corresponding caution wherever it is applied.
+
+For container attribution, the per-degree sensitivities in Table~\ref{tab:ted} translate into double-digit coefficient shifts at the temperature deltas that arise in practice. The gap between an architecture's calibration temperature and the die temperature it experiences beside a hot neighbor reaches 15 to 20\textdegree C in our co-location runs, producing TED corrections of up to 38.7\% (Section~\ref{sec:attribution}). Proportional allocation has no mechanism to account for this.
+
+\subsection{Sustained Power Proportionality}
+\label{sec:spp_results}
+
+\begin{table}[t]
+\centering
+\caption{Sustained Power Proportionality}
+\label{tab:spp}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Model} & \textbf{SPP ($R^2$)} & \textbf{Slope (W per TO/s)} & \textbf{Intercept (W)} \\
+\midrule
+ResNet-18 & 0.993 & 7.37e-15 & $-$11.0 \\
+ResNet-50 & 0.991 & 1.00e-14 & $-$10.1 \\
+VGG-16 & 0.987 & 5.39e-15 & $-$20.9 \\
+RNN & 0.963 & 8.62e-15 & $-$1.4 \\
+LSTM & 0.923 & 5.62e-15 & 3.7 \\
+GRU & 0.911 & 6.36e-15 & 3.9 \\
+XGBoost & 0.916 & 2.51e-10 & $-$1.4 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All seven architectures show high SPP ($R^2 > 0.91$), indicating that GPU power tracks transistor-operation throughput with reasonable linearity. CNNs show the highest proportionality (0.987 to 0.993), while gated recurrent architectures and XGBoost show slightly lower values (0.911 to 0.923). The gap matters for attribution: at the extremes, a 0.08 difference in SPP between GRU (0.911) and ResNet-18 (0.993) means that proportional allocation overestimates GRU's share of energy at low load levels and underestimates it at high load. The negative intercepts for CNNs suggest a fixed power threshold below which the GPU draws less than proportional energy, consistent with DVFS reducing voltage at low utilization.
+
+\subsection{Co-location Thermal Interference}
+\label{sec:colocation}
+
+\begin{table}[t]
+\centering
+\caption{Co-location Thermal Interference (priority pairs)}
+\label{tab:cti}
+\small
+\begin{tabular}{llrr}
+\toprule
+\textbf{Container A} & \textbf{Container B} & \textbf{CTI(A)} & \textbf{CTI(B)} \\
+\midrule
+VGG-16 & RNN & $-$0.005 & 4.222 \\
+ResNet-50 & XGBoost & 0.019 & 3.725 \\
+LSTM & GRU & 0.306 & 0.477 \\
+VGG-16 & ResNet-18 & 0.004 & 0.267 \\
+XGBoost & RNN & 0.474 & 0.222 \\
+ResNet-50 & LSTM & 0.054 & 2.961 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+CTI is strongly asymmetric across all tested pairs. When a heavy workload (VGG-16, ResNet-50) runs alongside a lightweight one (RNN, XGBoost), the lightweight container's apparent energy increases by 372 to 422\% because GPU-level power telemetry attributes the heavy workload's power draw to both containers equally. The heavy container's CTI remains near zero because its energy is already dominant. This asymmetry is the core mechanism behind proportional allocation error: both containers share measured GPU power, but their actual contributions to that power differ by up to 7.7$\times$. Section~\ref{sec:attribution} separates this telemetry contamination from genuine interference and quantifies it as a contamination factor of 5.7 to 17.8 for heterogeneous pairs.
+
+The LSTM+GRU pair, which has the most similar energy profiles, shows the most symmetric CTI (0.306 vs. 0.477), confirming that CTI asymmetry correlates with workload heterogeneity.
+
+\subsection{Attribution Error Analysis}
+\label{sec:attribution}
+
+We evaluate four attribution rules on identical inputs for every pair: the proportional baseline of Eq.~\ref{eq:proportional}; the raw physics estimate $\hat{E}_i$ of Section~\ref{sec:model}, which does not distribute the residual and therefore does not conserve the measured total; the conservative model of Eq.~\ref{eq:toml_attribution} with static calibrated coefficients; and the same model with TED-adjusted coefficients per Eq.~\ref{eq:ted_adjust}. Table~\ref{tab:attribution} summarizes absolute error against the isolated reference over all 12 container observations, and Table~\ref{tab:percontainer} reports each container together with its measured throughput retention under MPS.
+
+\begin{table}[t]
+\centering
+\caption{Attribution Error Ablation (12 container observations)}
+\label{tab:attribution}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Method} & \textbf{Mean (\%)} & \textbf{Median (\%)} & \textbf{Max (\%)} \\
+\midrule
+Proportional & 70.2 & 47.4 & 194.9 \\
+TOML raw (non-conserving) & 31.3 & 15.7 & 80.2 \\
+TOML static & 34.9 & 30.6 & 79.8 \\
+TOML+TED & 32.9 & 30.6 & 77.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Per-Container Error and Throughput Retention (Work = TO completed co-located as a percentage of isolated)}
+\label{tab:percontainer}
+\small
+\begin{tabular}{llrrr}
+\toprule
+\textbf{Pair} & \textbf{Container} & \textbf{Work (\%)} & \textbf{Prop (\%)} & \textbf{TOML+TED (\%)} \\
+\midrule
+VGG16+RNN & VGG-16 & 91.4 & 49.5 & 7.6 \\
+VGG16+RNN & RNN & 39.5 & 194.9 & 49.9 \\
+R50+XGB & ResNet-50 & 88.1 & 48.2 & 6.9 \\
+R50+XGB & XGBoost & 41.2 & 180.6 & 42.8 \\
+LSTM+GRU & LSTM & 84.6 & 34.6 & 31.4 \\
+LSTM+GRU & GRU & 83.9 & 26.1 & 29.7 \\
+VGG16+R18 & VGG-16 & 86.3 & 48.7 & 14.3 \\
+VGG16+R18 & ResNet-18 & 20.0 & 32.4 & 77.7 \\
+XGB+RNN & XGBoost & 80.9 & 20.6 & 12.0 \\
+XGB+RNN & RNN & 92.9 & 36.6 & 43.4 \\
+R50+LSTM & ResNet-50 & 96.0 & 46.7 & 1.3 \\
+R50+LSTM & LSTM & 19.8 & 123.6 & 77.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+Proportional allocation misattributes energy by 70.2\% on average, with a worst case of 194.9\% for RNN co-located with VGG-16. The conservative TOML model with TED-adjusted coefficients cuts the mean to 32.9\% and the maximum to 77.7\%. The raw physics estimate posts the lowest mean of all (31.3\%) but is not a billing scheme: its attributions do not sum to the measured total, and the shortfall it leaves unassigned is exactly the interference overhead a real deployment must account for. Among rules that conserve energy, TED-adjusted TOML is the most accurate on every aggregate.
+
+The raw estimate exposes the structure of the residual error. Because $\hat{E}_i = N_{TO}^{(i)} E_{TO}^{(i)}$ and the isolated reference equals the same coefficient multiplied by the isolated operation count, the raw error of each container equals its measured throughput loss under MPS. That loss is severe and asymmetric: ResNet-18 completes only 20.0\% of its isolated work beside VGG-16, and LSTM only 19.8\% beside ResNet-50, while the heavy partners retain 86 to 96\%. The mean throughput loss across all observations is 31.3\%, on par with the 32.9\% mean deviation of TOML+TED from the isolated reference: at the aggregate level the model departs from the physically explained slowdown by about 1.6 points, and per container the TED and residual terms recover part of the slowdown gap for light tenants while tracking the heavy tenants within 1.3 to 14.3\% (Table~\ref{tab:percontainer}). Co-located containers are billed less than their isolated cost mainly because they completed less work, which is the behavior a fair scheme should have.
+
+TED contributes where the physics says it should. The correction is largest for containers whose calibration temperature sits far below their co-located operating temperature: XGBoost beside ResNet-50 runs 19.1\textdegree C above calibration, its coefficient rises 38.7\%, and its error falls from 58.8\% to 42.8\%; RNN beside VGG-16 (coefficient up 26.3\%) improves from 59.8\% to 49.9\%; XGBoost beside RNN improves from 19.1\% to 12.0\%. VGG-16 itself calibrates at 75.6\textdegree C, already at its co-located temperature, so its coefficient barely moves. Table~\ref{tab:percontainer} also contains three rows where proportional allocation lands numerically closer to the isolated reference, most visibly ResNet-18 beside VGG-16 (32.4\% against 77.7\%). The proximity is coincidental: proportional assigns ResNet-18 half of a total dominated by VGG-16, which happens to approximate its isolated cost while charging it for work it did not perform. ResNet-18 completed one fifth of its isolated throughput in that window; the lower TOML attribution reflects the completed work, and the gap to the isolated reference is the slowdown itself, not a billing error.
+
+The residual $E_{ov}$ is signed. Five pairs show positive interference overhead; the LSTM and GRU pair shows the opposite. Its co-located total (4,814J) is 30.6\% below the sum of the isolated runs (6,938J), so consolidating two similar light workloads saves energy at a throughput cost near 15 to 16\% each, and the conservative rule credits the saving to both tenants. CTI, finally, quantifies why model-based attribution is necessary at all. Summing the two containers' self-reported delta energies yields 1.83 to 2.00 times the host-verified total across the six pairs, model-free evidence that per-container readings double count shared power. Because device-level telemetry reports whole-GPU power to every container, the energy a light tenant observes for itself exceeds its TOML-attributed energy by a factor of 5.7 (ResNet-18 beside VGG-16) to 17.8 (LSTM beside ResNet-50). Any monitoring stack that trusts per-container NVML readings under MPS inherits distortions of this magnitude.
+
+\subsection{Cross-Platform Validation}
+
+Table~\ref{tab:cross_platform} compares energy per transistor operation across the NVIDIA A100 (this work) and RTX 4090 Laptop GPU~\cite{syed2026toml}; Fig.~\ref{fig:cross_platform} plots the same comparison.
+
+\begin{table}[t]
+\centering
+\caption{Cross-Platform $E_{TO}$ Comparison (A100 values are means of 3 bare-metal runs)}
+\label{tab:cross_platform}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Model} & \textbf{4090 $E_{TO}$} & \textbf{A100 $E_{TO}$} & \textbf{Ratio} \\
+\midrule
+ResNet-18 & 4.39e-15 & 6.55e-15 & 1.49 \\
+ResNet-50 & 7.75e-15 & 8.93e-15 & 1.15 \\
+VGG-16 & 4.56e-15 & 4.89e-15 & 1.07 \\
+RNN & 4.89e-15 & 7.49e-15 & 1.53 \\
+LSTM & 5.53e-15 & 5.09e-15 & 0.92 \\
+GRU & 6.75e-15 & 5.71e-15 & 0.85 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig5_cross_platform.pdf}
+\caption{Cross-platform E/TO comparison (A100 means of 3 runs). Despite 2 to 3$\times$ raw power differences, E/TO remains within 1.5$\times$ for five of six architectures.}
+\label{fig:cross_platform}
+\end{figure}
+
+$E_{TO}$ remains consistent across two GPU architectures (Ada Lovelace vs. Ampere) with very different power envelopes (150W vs. 400W TDP). Five of six neural network architectures show $E_{TO}$ ratios within 1.5$\times$, despite the A100 drawing 2 to 3$\times$ higher raw power. This consistency indicates that TOML's transistor-operation model captures a property of each workload that does not depend on the specific GPU, which supports transferring calibrated coefficients across hardware generations.
+
+
+%==============================================================================
+\section{Container-Aware Attribution Architecture}
+\label{sec:architecture}
+%==============================================================================
+
+We propose a lightweight attribution layer that integrates TOML metrics into existing cloud observability stacks, requiring no hardware modifications beyond standard GPU performance counters. A metric exporter, deployed as a sidecar container or Kubernetes DaemonSet on each GPU node, discovers active GPU containers through the container runtime API, identifies each workload's architecture (via user-supplied labels or a brief TO profiling run of approximately 5 seconds per new image), and computes the TOML metrics from NVML counters, exposing them as Prometheus endpoints. An attribution engine applies the model of Section~\ref{sec:model} (Eq.~\ref{eq:toml_attribution}): per-architecture coefficients come from the calibration store, the running die temperature drives the TED adjustment of Eq.~\ref{eq:ted_adjust}, and the signed residual between measured total energy and the summed physics estimates is distributed by completed transistor operation share. A Grafana dashboard reports per-container attributed energy, thermal state, and the divergence from what proportional allocation would have charged.
+
+The exporter integrates with existing infrastructure at three levels: (1) Kubernetes, as a DaemonSet with GPU node affinity scraped by Prometheus Operator; (2) cloud billing, exporting attributed energy to cost management APIs for per-tenant invoicing; (3) carbon accounting, feeding into frameworks such as Cloud Carbon Footprint~\cite{ccf2026} with workload-specific rather than average-case carbon intensity factors, in the spirit of instance-level carbon measurement efforts~\cite{dodge2022measuring}. Overhead is negligible: at 50ms sampling the exporter consumes less than 0.1\% of a single CPU core and zero GPU compute.
+
+
+%==============================================================================
+\section{Discussion}
+\label{sec:discussion}
+%==============================================================================
+
+\subsection{Implications for Cloud Operators}
+
+Proportional allocation produces systematic errors that grow with workload heterogeneity, so attribution accuracy degrades exactly as operators consolidate diverse ML workloads and as billing and carbon accounting grow more consequential.
+
+TOML-aware attribution opens the door to energy billing based on actual consumption. Operators could charge per transistor operation, adjusted for thermal state, instead of a flat rate per GPU-second. Under such a model, tenants who deploy memory-efficient architectures would pay less per unit of capability, creating an economic incentive for energy-aware model design. The stakes are concrete in our measurements: under proportional billing the RNN tenant beside VGG-16 pays 2.9 times its attributed energy while the VGG-16 tenant is undercharged by 49.5\%, and any chargeback or carbon program built on those numbers transfers exactly that distortion.
+
+\subsection{Implications for Sustainability}
+
+Carbon accounting frameworks built on proportional allocation will misattribute emissions across workloads. Organizations reporting Scope 2 emissions from cloud GPU usage may see carbon footprints distorted by the factors measured in this study. TOML metrics make it possible to compute workload-specific carbon intensity based on the physical energy each container consumes.
+
+These distortions compound at the scale now being provisioned. Sovereign AI programs across the Global South have announced over 200 billion dollars in state-led commitments between 2024 and 2026, siting GPU clusters at the thousand-accelerator scale across host countries whose grids and cooling constraints differ widely~\cite{syed2026sovereign}. In multi-tenant deployments of that size, per-tenant Scope 2 reporting built on proportional allocation inherits the errors measured here: a light workload can be charged nearly three times its physical consumption, and the distortion lands exactly where environmental accountability draws the most scrutiny. Attribution grounded in device physics is a precondition for carbon accounting that survives aggregation from container to cluster to national inventory.
+
+\subsection{Limitations}
+
+Several limitations apply. First, our benchmark suite covers seven architectures but does not include transformers, which dominate modern ML deployments; extending TOML's operation counting to attention mechanisms is the subject of ongoing work. Second, we evaluate pairs of co-located containers under MPS. Time-slicing reduces attribution to temporal accounting, but MIG deployments, in which partitions share the die's thermal envelope and whole-GPU power telemetry~\cite{vamja2025mig}, remain unmeasured: we expect an attenuated form of CTI there, and quantifying it is future work, as is co-location of three or more tenants. Third, each co-location pair reflects a single instrumented run, cross-checked against independent host telemetry, whereas calibration phases use 3 repetitions; the XGBoost thermal sensitivity in particular rests on a weak fit ($r^2 = 0.31$), and its TED correction carries that uncertainty. Fourth, the TO profiling phase requires knowledge of the model architecture; auto-detection from execution traces is an open problem. Finally, our ground truth is the isolated-run reference, which prices GPU occupancy rather than completed work; alternative references encode different fairness policies, and we state ours explicitly in Section~\ref{sec:setup}.
+
+
+%==============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%==============================================================================
+
+We extended TOML from bare-metal to cloud environments with three container-aware metrics and integrated them into a conservative attribution model: TED corrects calibrated coefficients for die temperature, SPP justifies distributing the residual by completed transistor operations, and CTI quantifies the interference that residual contains. Across six MPS co-location pairs on an NVIDIA A100, proportional allocation, the method used by all major container energy tools, misattributes energy by 70.2\% on average and up to 194.9\%. The TED-adjusted model reduces the mean to 32.9\% and the maximum to 77.7\%, and the ablation decomposition shows that nearly all remaining deviation from the isolated reference is contention slowdown the containers actually experienced rather than model error. Device-level telemetry under MPS overstates light tenants by factors of 5.7 to 17.8, and the interference residual is signed: consolidating two similar light workloads saved 30.6\% energy in our measurements, a credit the conservative rule passes to both tenants.
+
+The 7.7$\times$ power range across seven benchmark architectures, together with measurable thermal efficiency decay on datacenter hardware, confirms that GPU energy cannot be split evenly by time. Cloud operators facing pressure for accurate carbon accounting and fair billing need physics-grounded attribution as an alternative to proportional allocation.
+
+The attribution architecture described here requires no hardware changes, fits into standard observability stacks, and adds minimal overhead. All code, measurement data, and analysis scripts are available upon request during review and will be released as open source upon publication.
+% CAMERA-READY: replace the availability clause with \url{https://github.com/jemsbhai/TOMLCloud}
+
+
+%==============================================================================
+% Acknowledgments
+%==============================================================================
+% ANONYMIZED FOR DOUBLE-BLIND REVIEW. RESTORE AT CAMERA-READY:
+% \section*{Acknowledgments}
+% Experiments were conducted on Lambda Labs cloud infrastructure. The authors used LLM-assisted tools (Claude, Anthropic) for grammar and spell checking, code formatting, and scripting assistance during experimental automation.
+
+%==============================================================================
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}

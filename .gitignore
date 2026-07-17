@@ -1,0 +1,54 @@
+# Raw 50ms power traces are large (~180 MB) and are not read by the analysis
+# pipeline; they are the archival source from which the *_summary.json files
+# were derived on the measurement instance. Ignored by default, with the
+# reproducibility set re-included below.
+data/**/*.csv
+data/**/*.json
+data/**/*.jsonl
+!data/**/.gitkeep
+
+# Reproducibility set: everything scripts/run_phase6_analysis_v1.py and
+# scripts/generate_figures_v1.py read, plus their outputs. A clean clone can
+# regenerate every number and figure in the paper from these alone (~9 MB).
+!data/**/*_summary.json
+!data/phase3_thermal/*_windows.csv
+!data/phase5_colocation/*.csv
+!data/phase6_attribution/*.csv
+!data/phase6_attribution/*.json
+
+# Instance metadata (regenerated on each instance)
+data/instance_metadata.csv
+data/cost_log.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+*.egg
+
+# Docker
+docker/build/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env
+.env
+.env.local
